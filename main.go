@@ -1,13 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,9 +21,98 @@ import (
 
 const (
 	socketAddress = "/run/docker/plugins/jfs.sock"
-	cliPath       = "/usr/bin/juicefs"
-	ceCliPath     = "/bin/juicefs"
+
+	// Community Edition CLI (metaurl-based), pinned via JUICEFS_CE_VERSION.
+	ceCliPath = "/bin/juicefs"
+
+	// Enterprise/Cloud CLI (token-based), downloaded from JUICEFS_EE_URL.
+	eeCliPath = "/usr/bin/juicefs"
 )
+
+// Detect legacy/new CLI behaviors to keep compatibility across versions.
+func isAuthUnsupported(output string) bool {
+	out := strings.ToLower(output)
+	return strings.Contains(out, "no help topic for 'auth'") ||
+		(strings.Contains(out, "unknown") && strings.Contains(out, "auth")) ||
+		strings.Contains(out, "unknown option: --token") ||
+		strings.Contains(out, "unknown flag: --token") ||
+		strings.Contains(out, "flag provided but not defined: --token")
+}
+
+func canonicalize(k string) string {
+	switch k {
+	case "accesskey":
+		return "access-key"
+	case "accesskey2":
+		return "access-key2"
+	case "secretkey":
+		return "secret-key"
+	case "secretkey2":
+		return "secret-key2"
+	default:
+		return k
+	}
+}
+
+// sanitizeOutput replaces any sensitive values with "****" so we can safely
+// log JuiceFS CLI output.
+func sanitizeOutput(out string, secrets []string) string {
+	redacted := out
+	for _, s := range secrets {
+		if s == "" {
+			continue
+		}
+		redacted = strings.ReplaceAll(redacted, s, "****")
+	}
+	return redacted
+}
+
+// waitForMountReady polls the mountpoint until it becomes a JuiceFS mount
+// (root inode == 1) or times out.
+func waitForMountReady(mountpoint string) error {
+	touch := exec.Command("touch", filepath.Join(mountpoint, ".juicefs"))
+	lastErr := fmt.Errorf("mountpoint %s did not become ready", mountpoint)
+
+	for attempt := 0; attempt < 10; attempt++ {
+		fi, err := os.Lstat(mountpoint)
+		if err == nil {
+			stat, ok := fi.Sys().(*syscall.Stat_t)
+			if !ok {
+				return logError("Not a syscall.Stat_t")
+			}
+			if stat.Ino == 1 {
+				if err := touch.Run(); err == nil {
+					return nil
+				}
+				lastErr = err
+			} else {
+				lastErr = fmt.Errorf("mountpoint %s not yet a JuiceFS mount (ino=%d)", mountpoint, stat.Ino)
+			}
+		} else {
+			lastErr = err
+		}
+
+		logrus.Debugf("Error in attempt %d waiting for %s: %#v", attempt+1, mountpoint, lastErr)
+		time.Sleep(time.Second)
+	}
+
+	return logError(lastErr.Error())
+}
+
+// isJuiceFSMountedRoot checks if the given path is a JuiceFS mount root by
+// looking for inode 1. This is used only for diagnostics; bind-mount mode
+// should be controlled via explicit options, not heuristics.
+func isJuiceFSMountedRoot(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return stat.Ino == 1
+}
 
 type jfsVolume struct {
 	Name        string
@@ -78,13 +168,13 @@ func (d *jfsDriver) saveState() {
 func ceMount(v *jfsVolume) error {
 	options := map[string]string{}
 	format := exec.Command(ceCliPath, "format", "--no-update")
-	for k, v := range v.Options {
+	for k, val := range v.Options {
 		if k == "env" {
-			format.Env = append(os.Environ(), strings.Split(v, ",")...)
-			logrus.Debug("modified env: %s", format.Env)
+			format.Env = append(os.Environ(), strings.Split(val, ",")...)
+			logrus.Debugf("modified env for volume %s: %v", v.Name, format.Env)
 			continue
 		}
-		options[k] = v
+		options[k] = val
 	}
 	formatOptions := []string{
 		"block-size",
@@ -114,6 +204,13 @@ func ceMount(v *jfsVolume) error {
 
 	// options left for `juicefs mount`
 	mount := exec.Command(ceCliPath, "mount")
+	// ensure we don't attempt to auto-download helper and prefer bundled one
+	mount.Env = append(os.Environ(), "JFS_NO_UPDATE=1")
+	if _, err := os.Stat("/bin/jfsmount"); err == nil {
+		mount.Env = append(mount.Env, "JFS_MOUNT_BIN=/bin/jfsmount")
+	}
+	// run mount in background to avoid blocking and ensure child lifecycle isn't tied to plugin process
+	mount.Args = append(mount.Args, "-d")
 	mountFlags := []string{
 		"cache-partial-only",
 		"enable-xattr",
@@ -134,77 +231,96 @@ func ceMount(v *jfsVolume) error {
 	}
 	mount.Args = append(mount.Args, v.Source, v.Mountpoint)
 	logrus.Debug(mount)
-	go func() {
-		output, _ := mount.CombinedOutput()
-		logrus.Debug(string(output))
-	}()
-
-	touch := exec.Command("touch", v.Mountpoint+"/.juicefs")
-	var fileinfo os.FileInfo
-	var err error
-	for attempt := 0; attempt < 10; attempt++ {
-		if fileinfo, err = os.Lstat(v.Mountpoint); err == nil {
-			stat, ok := fileinfo.Sys().(*syscall.Stat_t)
-			if !ok {
-				return logError("Not a syscall.Stat_t")
-			}
-			if stat.Ino == 1 {
-				if err = touch.Run(); err == nil {
-					return nil
-				}
-			}
-		}
-		logrus.Debugf("Error in attempt %d: %#v", attempt+1, err)
-		time.Sleep(time.Second)
-	}
-	return logError(err.Error())
-}
-
-func eeMount(v *jfsVolume) error {
-	auth := exec.Command(cliPath, "auth", v.Name)
-	options := map[string]string{}
-	for k, v := range v.Options {
-		if k == "env" {
-			auth.Env = append(os.Environ(), strings.Split(v, ",")...)
-			logrus.Debug("modified env: %s", auth.Env)
-			continue
-		}
-		options[k] = v
-	}
-	commonOptions := []string{"subdir"}
-	authOptions := slices.Concat([]string{
-		"token",
-		"accesskey",
-		"accesskey2",
-		"access-key",
-		"access-key2",
-		"bucket",
-		"bucket2",
-		"secretkey",
-		"secretkey2",
-		"secret-key",
-		"secret-key2",
-		"passphrase",
-	}, commonOptions)
-	for _, authOption := range authOptions {
-		val, ok := options[authOption]
-		if !ok {
-			continue
-		}
-		// auth 的参数确实可以是空, 没有flag
-		auth.Args = append(auth.Args, fmt.Sprintf("--%s=%s", authOption, val))
-		if !slices.Contains(commonOptions, authOption) {
-			delete(options, authOption)
-		}
-	}
-	logrus.Debug(auth)
-	if out, err := auth.CombinedOutput(); err != nil {
-		logrus.Errorf("juicefs auth error: %s", out)
+	// Start mount in background to avoid waitid/ECHILD issues when the helper daemonizes.
+	if err := mount.Start(); err != nil {
 		return logError(err.Error())
 	}
 
-	// options left for `juicefs mount`
-	mount := exec.Command(cliPath, "mount", v.Name, v.Mountpoint)
+	return waitForMountReady(v.Mountpoint)
+}
+
+func eeMount(v *jfsVolume) error {
+	// Copy options so we can safely mutate them.
+	mountOpts := map[string]string{}
+	for k, val := range v.Options {
+		mountOpts[k] = val
+	}
+
+	// Build environment. "env" option is used only to inject env vars, not as a CLI flag.
+	env := os.Environ()
+	if envOpt, ok := mountOpts["env"]; ok && envOpt != "" {
+		env = append(env, strings.Split(envOpt, ",")...)
+		delete(mountOpts, "env")
+		logrus.Debugf("modified env for volume %s: %v", v.Name, env)
+	}
+
+	// Secrets for log redaction.
+	secrets := []string{
+		mountOpts["token"],
+		mountOpts["access-key"],
+		mountOpts["accesskey"],
+		mountOpts["access-key2"],
+		mountOpts["accesskey2"],
+		mountOpts["secret-key"],
+		mountOpts["secretkey"],
+		mountOpts["secret-key2"],
+		mountOpts["secretkey2"],
+	}
+
+	// Map storage credentials to environment variables instead of CLI flags.
+	// This keeps them out of logs and avoids CLI option changes breaking mounts.
+	if val, ok := mountOpts["access-key"]; ok && val != "" {
+		env = append(env, "ACCESS_KEY="+val)
+	}
+	if val, ok := mountOpts["accesskey"]; ok && val != "" {
+		env = append(env, "ACCESS_KEY="+val)
+	}
+	if val, ok := mountOpts["access-key2"]; ok && val != "" {
+		env = append(env, "ACCESS_KEY2="+val)
+	}
+	if val, ok := mountOpts["accesskey2"]; ok && val != "" {
+		env = append(env, "ACCESS_KEY2="+val)
+	}
+	if val, ok := mountOpts["secret-key"]; ok && val != "" {
+		env = append(env, "SECRET_KEY="+val)
+	}
+	if val, ok := mountOpts["secretkey"]; ok && val != "" {
+		env = append(env, "SECRET_KEY="+val)
+	}
+	if val, ok := mountOpts["secret-key2"]; ok && val != "" {
+		env = append(env, "SECRET_KEY2="+val)
+	}
+	if val, ok := mountOpts["secretkey2"]; ok && val != "" {
+		env = append(env, "SECRET_KEY2="+val)
+	}
+
+		// ---- EE auth: juicefs auth NAME --token=... ----
+		authToken := ""
+		if val, ok := mountOpts["token"]; ok && val != "" {
+			authToken = val
+		}
+		auth := exec.Command(eeCliPath, "auth", v.Name)
+		auth.Env = env
+		if authToken != "" {
+			auth.Args = append(auth.Args, fmt.Sprintf("--token=%s", authToken))
+		}
+		logrus.Debug(auth)
+		if out, err := auth.CombinedOutput(); err != nil {
+			msg := sanitizeOutput(string(bytes.TrimSpace(out)), secrets)
+			return logError("juicefs auth failed for volume %s: %s", v.Name, msg)
+		}
+	
+		// ---- EE mount: juicefs mount NAME MOUNTPOINT [options] ----
+
+	mount := exec.Command(eeCliPath, "mount", v.Name, v.Mountpoint)
+	// do not auto-download jfsmount; prefer bundled helper if present
+	mount.Env = append(env, "JFS_NO_UPDATE=1")
+	if _, err := os.Stat("/bin/jfsmount"); err == nil {
+		mount.Env = append(mount.Env, "JFS_MOUNT_BIN=/bin/jfsmount")
+	}
+	// run mount in background for EE
+	mount.Args = append(mount.Args, "-d")
+
 	mountFlags := []string{
 		"external",
 		"internal",
@@ -216,42 +332,68 @@ func eeMount(v *jfsVolume) error {
 		"allow-root",
 		"enable-xattr",
 	}
-	for _, mountFlag := range mountFlags {
-		_, ok := options[mountFlag]
-		if !ok {
-			continue
-		}
-		mount.Args = append(mount.Args, fmt.Sprintf("--%s", mountFlag))
-		delete(options, mountFlag)
+
+	// Normalize option names for mount.
+	norm := map[string]string{}
+	for k, val := range mountOpts {
+		norm[canonicalize(k)] = val
 	}
-	for mountOption, val := range options {
-		mount.Args = append(mount.Args, fmt.Sprintf("--%s=%s", mountOption, val))
-	}
-	logrus.Debug(mount)
-	if out, err := mount.CombinedOutput(); err != nil {
-		logrus.Errorf("juicefs mount error: %s", out)
-		return logError(err.Error())
+	mountOpts = norm
+
+		// Capture token separately for potential future use; current CLI flow
+		// only requires it during auth, not mount.
+	token := ""
+	if val, ok := mountOpts["token"]; ok && val != "" {
+		token = val
+		delete(mountOpts, "token")
 	}
 
-	touch := exec.Command("touch", v.Mountpoint+"/.juicefs")
-	var fileinfo os.FileInfo
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		if fileinfo, err = os.Lstat(v.Mountpoint); err == nil {
-			stat, ok := fileinfo.Sys().(*syscall.Stat_t)
-			if !ok {
-				return logError("Not a syscall.Stat_t")
-			}
-			if stat.Ino == 1 {
-				if err = touch.Run(); err == nil {
-					return nil
-				}
-			}
-		}
-		logrus.Debugf("Error in attempt %d: %#v", attempt+1, err)
-		time.Sleep(time.Second)
+	// Object storage credentials belong in env, not as `mount` flags.
+	// Strip all storage-related options before building the mount args.
+	for _, k := range []string{
+		"access-key", "accesskey", "access-key2", "accesskey2",
+		"secret-key", "secretkey", "secret-key2", "secretkey2",
+		"bucket", "bucket2",
+		"storage",
+	} {
+		delete(mountOpts, k)
 	}
-	return logError(err.Error())
+
+	// Append flags and k=v options
+	for _, mountFlag := range mountFlags {
+		if _, ok := mountOpts[mountFlag]; ok {
+			mount.Args = append(mount.Args, fmt.Sprintf("--%s", mountFlag))
+			delete(mountOpts, mountFlag)
+		}
+	}
+	for k, val := range mountOpts {
+		mount.Args = append(mount.Args, fmt.Sprintf("--%s=%s", k, val))
+	}
+	if token != "" {
+		mount.Args = append(mount.Args, fmt.Sprintf("--token=%s", token))
+	}
+	logrus.Debug(mount)
+
+	// Capture output in the background so we can log errors (sanitized) without blocking.
+	stdout, _ := mount.StdoutPipe()
+	stderr, _ := mount.StderrPipe()
+
+	if err := mount.Start(); err != nil {
+		return logError("failed to start juicefs mount for volume %s: %v", v.Name, err)
+	}
+
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, io.MultiReader(stdout, stderr))
+		if err := mount.Wait(); err != nil {
+			msg := sanitizeOutput(buf.String(), secrets)
+			// When the helper daemonizes, Wait can return errors like ECHILD; treat as debug.
+			logrus.Debugf("juicefs mount process for volume %s exited with error (may be benign if daemonized): %s", v.Name, msg)
+		}
+	}()
+
+	// Finally, poll for the mount to become ready.
+	return waitForMountReady(v.Mountpoint)
 }
 
 func mountVolume(v *jfsVolume) error {
@@ -340,7 +482,11 @@ func (d *jfsDriver) Remove(r *volume.RemoveRequest) error {
 	}
 
 	if err := os.Remove(v.Mountpoint); err != nil {
-		return logError(err.Error())
+		// Be tolerant when the mountpoint directory is already gone
+		// so that probe/test volumes can be cleaned up without errors.
+		if !os.IsNotExist(err) {
+			return logError(err.Error())
+		}
 	}
 
 	delete(d.volumes, r.Name)
@@ -434,10 +580,10 @@ func logError(format string, args ...interface{}) error {
 }
 
 func main() {
-	debug := os.Getenv("DEBUG")
-	if ok, _ := strconv.ParseBool(debug); ok {
-		logrus.SetLevel(logrus.DebugLevel)
-	}
+    debug := os.Getenv("DEBUG")
+    if ok, _ := strconv.ParseBool(debug); ok {
+        logrus.SetLevel(logrus.DebugLevel)
+    }
 
 	d, err := newJfsDriver("/jfs")
 	if err != nil {

@@ -7,7 +7,7 @@ services:
       - jfsvolume:/jfs
 volumes:
   jfsvolume:
-    driver: juicedata/juicefs:latest
+    driver: jakubs22/juicefs:arm64-latest
     driver_opts:
       name: ${JFS_VOL}
       token: ${JFS_TOKEN}

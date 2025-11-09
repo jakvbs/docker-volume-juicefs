@@ -4,6 +4,14 @@
 
 Modified from https://github.com/vieux/docker-volume-sshfs
 
+## Supported Architectures
+
+This plugin supports the following architectures:
+- `linux/amd64` (x86_64)
+- `linux/arm64` (aarch64)
+
+The plugin automatically detects the target architecture during build and downloads the appropriate JuiceFS binaries.
+
 ## Usage
 
 ``` shell
@@ -19,6 +27,24 @@ docker run -it -v jfsvolume:/opt busybox ls /opt
 ```
 
 ## Development
+
+### Multi-Architecture Build
+
+To build for multiple architectures using Docker buildx:
+
+``` shell
+make all-buildx
+```
+
+This will build the plugin for both `linux/amd64` and `linux/arm64` platforms.
+
+For single architecture builds:
+
+``` shell
+make all
+```
+
+### Local Development
 
 Boot up vagrant environment
 

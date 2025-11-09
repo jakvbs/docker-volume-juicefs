@@ -6,17 +6,47 @@ on:
 
 jobs:
   make:
-    name: Build
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+          - arch: arm64
+            os: ubuntu-24.04-arm
+      fail-fast: false
     steps:
-      - name: Set up Go 1.23
-        uses: actions/setup-go@v2
+      - name: Set up Go 1.25
+        uses: actions/setup-go@v6
         with:
-          go-version: 1.23
+          go-version: 1.25
         id: go
 
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
 
-      - name: Build
-        run: make
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build rootfs for target arch
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: make clean rootfs-buildx-arch
+
+      - name: Create plugin
+        env:
+          ARCH: ${{ matrix.arch }}
+          PLUGIN_TAG: ${{ matrix.arch }}-latest
+        run: make create
+
+      - name: Push plugin (only on main branch)
+        if: github.ref == 'refs/heads/master'
+        env:
+          ARCH: ${{ matrix.arch }}
+          PLUGIN_TAG: ${{ matrix.arch }}-latest
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin
+          make push

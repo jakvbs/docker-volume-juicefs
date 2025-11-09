@@ -11,6 +11,20 @@
                 "value"
             ],
             "value": "0"
+        },
+        {
+            "name": "JFS_NO_UPDATE",
+            "settable": [
+                "value"
+            ],
+            "value": "1"
+        },
+        {
+            "name": "JFS_MOUNT_BIN",
+            "settable": [
+                "value"
+            ],
+            "value": "/bin/jfsmount"
         }
     ],
     "interface": {
