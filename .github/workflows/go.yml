@@ -4,6 +4,10 @@ on:
     branches:
       - master
 
+concurrency:
+  group: go-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   make:
     name: Build (${{ matrix.arch }})
